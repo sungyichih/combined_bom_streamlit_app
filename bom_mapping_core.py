@@ -287,6 +287,9 @@ def map_cpn_to_spn(original_base_df, original_mpn_df, cpn_mapping_df, system_mpn
     for _, row in system_mpn_df.iterrows():
         spn = normalize_text(row['SPN'])
         mpn = normalize_key(row['System_MPN'])
+        # 被 cross 的 MPN 視為系統已無此料，不納入 SPN 挑選的 overlap 計算。
+        if row.get('Is_Crossed', False):
+            continue
         if spn not in sys_groups:
             sys_groups[spn] = set()
         if mpn:
@@ -396,13 +399,17 @@ def build_mpn_compare(mapped_df, original_mpn_df, system_mpn_df):
             bom_groups[cpn].add(mpn)
 
     sys_groups = {}
+    crossed_groups = {}
     for _, row in system_mpn_df.iterrows():
         spn = normalize_text(row["SPN"])
         mpn = normalize_key(row["System_MPN"])
-        if spn not in sys_groups:
-            sys_groups[spn] = set()
-        if mpn:
-            sys_groups[spn].add(mpn)
+        if not mpn:
+            continue
+        # 被 cross 的 MPN 另外存到 crossed_groups，不算進系統有效 MPN。
+        if row.get("Is_Crossed", False):
+            crossed_groups.setdefault(spn, set()).add(mpn)
+        else:
+            sys_groups.setdefault(spn, set()).add(mpn)
 
     compare_rows = []
     for _, row in mapped_df.iterrows():
@@ -430,6 +437,7 @@ def build_mpn_compare(mapped_df, original_mpn_df, system_mpn_df):
                 "Selection_Status": selection_status,
                 "BOM_MPN_List": " / ".join(sorted(bom_set)),
                 "System_MPN_List": "",
+                "Crossed_MPN_List": "",
                 "Missing_In_System": "",
                 "Extra_In_System": "",
                 "SPN_Detail_Comparison": spn_detail,
@@ -438,10 +446,15 @@ def build_mpn_compare(mapped_df, original_mpn_df, system_mpn_df):
             continue
 
         system_set = sys_groups.get(spn, set())
+        crossed_set = crossed_groups.get(spn, set())
         missing_in_system = sorted(bom_set - system_set)
         extra_in_system = sorted(system_set - bom_set)
+        # BOM 用到的 MPN 中，有哪些在系統裡是被 cross 的（最優先標注）。
+        crossed_in_bom = sorted(bom_set & crossed_set)
 
-        if not bom_set and not system_set:
+        if crossed_in_bom:
+            status = "MPN Crossed in System"
+        elif not bom_set and not system_set:
             status = "No MPN Data"
         elif not missing_in_system and not extra_in_system:
             status = "Full Match"
@@ -461,6 +474,7 @@ def build_mpn_compare(mapped_df, original_mpn_df, system_mpn_df):
             "Selection_Status": selection_status,
             "BOM_MPN_List": " / ".join(sorted(bom_set)),
             "System_MPN_List": " / ".join(sorted(system_set)),
+            "Crossed_MPN_List": " / ".join(crossed_in_bom),
             "Missing_In_System": " / ".join(missing_in_system),
             "Extra_In_System": " / ".join(extra_in_system),
             "SPN_Detail_Comparison": spn_detail,
@@ -519,6 +533,7 @@ def build_summary(original_base_df, mapped_df, compare_df):
         {'Metric': 'Partial Match count', 'Value': int((compare_df['MPN_Compare_Status'] == 'Partial Match').sum())},
         {'Metric': 'Missing in System count', 'Value': int((compare_df['MPN_Compare_Status'] == 'Missing in System').sum())},
         {'Metric': 'Extra in System count', 'Value': int((compare_df['MPN_Compare_Status'] == 'Extra in System').sum())},
+        {'Metric': 'MPN Crossed in System count', 'Value': int((compare_df['MPN_Compare_Status'] == 'MPN Crossed in System').sum())},
     ])
 
 def make_result_excel(original_base_df, original_mpn_df, mapped_df, compare_df, missing_spn_df, summary_df):
@@ -528,11 +543,12 @@ def make_result_excel(original_base_df, original_mpn_df, mapped_df, compare_df, 
     status_priority = {
         "Missing SPN": 1,
         "Ambiguous - same overlap": 2,
-        "Missing in System": 3,
-        "Extra in System": 4,
-        "Partial Match": 5,
-        "No MPN Data": 6,
-        "Full Match": 7,
+        "MPN Crossed in System": 3,
+        "Missing in System": 4,
+        "Extra in System": 5,
+        "Partial Match": 6,
+        "No MPN Data": 7,
+        "Full Match": 8,
     }
 
     compare_sorted["__sort_priority"] = compare_sorted["MPN_Compare_Status"].map(status_priority).fillna(99)
@@ -557,6 +573,7 @@ def make_result_excel(original_base_df, original_mpn_df, mapped_df, compare_df, 
         # 顏色分開
         missing_spn_fill = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")   # 最明顯深紅
         ambiguous_fill = PatternFill(fill_type="solid", start_color="E06666", end_color="E06666")     # 紅
+        crossed_fill = PatternFill(fill_type="solid", start_color="B4A7D6", end_color="B4A7D6")       # 紫（被 cross）
         missing_system_fill = PatternFill(fill_type="solid", start_color="F4B183", end_color="F4B183")# 深橘
         extra_system_fill = PatternFill(fill_type="solid", start_color="FCE5CD", end_color="FCE5CD")  # 淡橘
         partial_fill = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")       # 黃
@@ -571,6 +588,8 @@ def make_result_excel(original_base_df, original_mpn_df, mapped_df, compare_df, 
                 fill = missing_spn_fill
             elif status == "Ambiguous - same overlap":
                 fill = ambiguous_fill
+            elif status == "MPN Crossed in System":
+                fill = crossed_fill
             elif status == "Missing in System":
                 fill = missing_system_fill
             elif status == "Extra in System":

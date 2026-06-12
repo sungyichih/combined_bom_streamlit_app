@@ -11,6 +11,10 @@ import pandas as pd
 
 REQUIRED_COLUMNS = ["Material NO", "MFR. Name", "MFR. P/N"]
 
+# 這兩欄任一被標記 "X" 代表這顆 MPN 已被 cross（系統無法刪除，只能標記為不可使用）。
+# 屬於選用欄位：來源檔若沒有這兩欄，視為全部未 cross。
+CROSS_COLUMNS = ["Customer O", "OSE OUT"]
+
 
 @dataclass
 class ProcessResult:
@@ -27,6 +31,11 @@ def _normalize_text(value) -> str:
     if text.lower() == "nan":
         return ""
     return text
+
+
+def _is_x(value) -> bool:
+    """判斷 cross 欄位的值是否為 X（大小寫不拘）。"""
+    return _normalize_text(value).upper() == "X"
 
 
 def detect_header_row(excel_file) -> int:
@@ -51,7 +60,14 @@ def load_source_data(excel_file) -> pd.DataFrame:
     data = df[REQUIRED_COLUMNS].copy()
     data.columns = ["SPN", "Manufacturer", "MPN"]
 
-    for col in data.columns:
+    # Customer O / OSE OUT 任一為 "X" → 這顆 MPN 被 cross（選用欄位，缺欄位則全部 False）。
+    cross_series = pd.Series(False, index=df.index)
+    for col in CROSS_COLUMNS:
+        if col in df.columns:
+            cross_series = cross_series | df[col].map(_is_x)
+    data["Is_Crossed"] = cross_series
+
+    for col in ["SPN", "Manufacturer", "MPN"]:
         data[col] = data[col].map(_normalize_text)
 
     ignored_incomplete_rows = int(((data["SPN"] == "") | (data["MPN"] == "")).sum())
@@ -63,6 +79,8 @@ def load_source_data(excel_file) -> pd.DataFrame:
 
 def build_mapping(data: pd.DataFrame) -> pd.DataFrame:
     mapping_df = data.copy()
+    if "Is_Crossed" not in mapping_df.columns:
+        mapping_df["Is_Crossed"] = False
 
     spn_to_mpn_count = mapping_df.groupby("SPN")["MPN"].nunique()
     mpn_to_spn_count = mapping_df.groupby("MPN")["SPN"].nunique()
@@ -73,6 +91,8 @@ def build_mapping(data: pd.DataFrame) -> pd.DataFrame:
 
     def build_remarks(row) -> str:
         flags = []
+        if row["Is_Crossed"]:
+            flags.append("❌ Crossed (Customer O / OSE OUT)")
         if row["exact_duplicate"]:
             flags.append("Exact Duplicate")
         if row["duplicate_mpn"]:
@@ -84,7 +104,7 @@ def build_mapping(data: pd.DataFrame) -> pd.DataFrame:
     mapping_df["Remarks"] = mapping_df.apply(build_remarks, axis=1)
 
     return mapping_df[
-        ["SPN", "Manufacturer", "MPN", "Remarks", "exact_duplicate", "duplicate_mpn", "multi_mpn_spn"]
+        ["SPN", "Manufacturer", "MPN", "Remarks", "Is_Crossed", "exact_duplicate", "duplicate_mpn", "multi_mpn_spn"]
     ]
 
 
@@ -133,6 +153,7 @@ def build_duplicate_mpn_table(mapping_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_summary(mapping_df: pd.DataFrame, ignored_incomplete_rows: int) -> dict:
     duplicate_mpn_mask = mapping_df["duplicate_mpn"]
+    crossed_mask = mapping_df["Is_Crossed"] if "Is_Crossed" in mapping_df.columns else pd.Series(False, index=mapping_df.index)
     summary = {
         "total_records": int(len(mapping_df)),
         "unique_spns": int(mapping_df["SPN"].nunique()),
@@ -141,6 +162,7 @@ def build_summary(mapping_df: pd.DataFrame, ignored_incomplete_rows: int) -> dic
         "duplicate_mpns": int((mapping_df.groupby("MPN")["SPN"].nunique() > 1).sum()),
         "rows_affected_by_duplicate_mpn": int(duplicate_mpn_mask.sum()),
         "exact_duplicate_rows": int(mapping_df["exact_duplicate"].sum()),
+        "crossed_mpn_rows": int(crossed_mask.sum()),
         "ignored_incomplete_rows": int(ignored_incomplete_rows),
     }
     return summary
@@ -173,6 +195,7 @@ def create_excel_report(result: ProcessResult) -> bytes:
         ("Duplicate MPNs (same MPN → multiple SPNs)", result.summary["duplicate_mpns"]),
         ("Rows affected by duplicate MPN", result.summary["rows_affected_by_duplicate_mpn"]),
         ("Exact duplicate rows (same SPN + MPN)", result.summary["exact_duplicate_rows"]),
+        ("Crossed MPN rows (Customer O / OSE OUT = X)", result.summary.get("crossed_mpn_rows", 0)),
         ("Ignored incomplete rows", result.summary["ignored_incomplete_rows"]),
     ]
     summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
@@ -206,6 +229,7 @@ def create_excel_report(result: ProcessResult) -> bytes:
         fmt_multi = workbook.add_format({"bg_color": "#FFF2CC", "border": 1})
         fmt_dup = workbook.add_format({"bg_color": "#F4CCCC", "border": 1})
         fmt_exact = workbook.add_format({"bg_color": "#EA9999", "border": 1})
+        fmt_crossed = workbook.add_format({"bg_color": "#B4A7D6", "border": 1})
         fmt_legend_label = workbook.add_format({"bold": True})
 
         ws_summary.merge_range("A1:B1", "SPN-MPN Mapping Summary", fmt_title)
@@ -219,6 +243,8 @@ def create_excel_report(result: ProcessResult) -> bytes:
         ws_summary.write("B14", "Duplicate MPN — same MPN maps to multiple SPNs")
         ws_summary.write("A15", "🔴🔴", fmt_legend_label)
         ws_summary.write("B15", "Exact Duplicate — identical SPN + MPN row appears more than once")
+        ws_summary.write("A16", "🟣", fmt_legend_label)
+        ws_summary.write("B16", "Crossed — Customer O / OSE OUT marked X, treated as removed from system")
         for col_num, value in enumerate(summary_df.columns.values):
             ws_summary.write(2, col_num, value, fmt_header)
         for row_num in range(3, 3 + len(summary_df)):
@@ -234,7 +260,9 @@ def create_excel_report(result: ProcessResult) -> bytes:
             ws_mapping.write(0, idx, col, fmt_header)
 
         for row_idx, (_, row) in enumerate(result.mapping_df.iterrows(), start=1):
-            if row["exact_duplicate"]:
+            if row.get("Is_Crossed", False):
+                row_fmt = fmt_crossed
+            elif row["exact_duplicate"]:
                 row_fmt = fmt_exact
             elif row["duplicate_mpn"]:
                 row_fmt = fmt_dup

@@ -29,8 +29,14 @@ def reset_file(file_obj):
 
 def make_system_mpn_df(mpn_result: mpn_processor.ProcessResult) -> pd.DataFrame:
     """Convert MPN organizer result into the format needed by BOM mapping."""
-    df = mpn_result.mapping_df[["SPN", "Manufacturer", "MPN"]].copy()
-    df.columns = ["SPN", "System_MFG", "System_MPN"]
+    cols = ["SPN", "Manufacturer", "MPN"]
+    if "Is_Crossed" in mpn_result.mapping_df.columns:
+        cols.append("Is_Crossed")
+    df = mpn_result.mapping_df[cols].copy()
+    rename = {"Manufacturer": "System_MFG", "MPN": "System_MPN"}
+    df = df.rename(columns=rename)
+    if "Is_Crossed" not in df.columns:
+        df["Is_Crossed"] = False
     return df.drop_duplicates().reset_index(drop=True)
 
 
@@ -47,6 +53,7 @@ def render_status_legend():
 
         - 🔴 **Missing SPN** — highest priority
         - 🟥 **Ambiguous - same overlap**
+        - 🟣 **MPN Crossed in System** — BOM 用到系統已被 cross 的料
         - 🟧 **Missing in System**
         - 🟠 **Extra in System**
         - 🟨 **Partial Match**
@@ -60,6 +67,7 @@ def compare_row_style(row: pd.Series):
     color_map = {
         "Missing SPN": "#C00000",
         "Ambiguous - same overlap": "#E06666",
+        "MPN Crossed in System": "#B4A7D6",
         "Missing in System": "#F4B183",
         "Extra in System": "#FCE5CD",
         "Partial Match": "#FFF2CC",
@@ -80,6 +88,8 @@ def cpn_row_style(row: pd.Series):
 
 
 def mpn_row_style(row: pd.Series):
+    if row.get("Is_Crossed", False):
+        return ["background-color: #B4A7D6"] * len(row)
     if row.get("exact_duplicate", False):
         return ["background-color: #EA9999"] * len(row)
     if row.get("duplicate_mpn", False):
@@ -105,6 +115,7 @@ def main():
 
             **2. System MPN/SPN data**
             - Required source columns: `Material NO`, `MFR. Name`, and `MFR. P/N`
+            - Optional cross columns: `Customer O` and `OSE OUT` — 任一標記 `X` 代表這顆 MPN 已被 cross（系統視為不可使用 / 已移除）
 
             **3. Customer Original BOM**
             - Sheet name must be `BOM`
@@ -252,12 +263,13 @@ def main():
         )
 
     st.subheader("📌 Final Mapping Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Original BOM rows", len(original_base_df))
     m2.metric("Missing SPN", int((mapped_df["Selection_Status"] == "Missing SPN").sum()))
     m3.metric("Ambiguous", int((mapped_df["Selection_Status"] == "Ambiguous - same overlap").sum()))
-    m4.metric("Extra in System", int((compare_df["MPN_Compare_Status"] == "Extra in System").sum()))
-    m5.metric(
+    m4.metric("MPN Crossed", int((compare_df["MPN_Compare_Status"] == "MPN Crossed in System").sum()))
+    m5.metric("Extra in System", int((compare_df["MPN_Compare_Status"] == "Extra in System").sum()))
+    m6.metric(
         "MPN differences",
         int(
             compare_df["MPN_Compare_Status"].isin(
@@ -267,6 +279,7 @@ def main():
                     "Extra in System",
                     "Missing SPN",
                     "Ambiguous - same overlap",
+                    "MPN Crossed in System",
                 ]
             ).sum()
         ),
