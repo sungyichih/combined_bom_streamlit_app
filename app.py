@@ -254,10 +254,11 @@ def main():
         )
 
     with d3:
+        original_bom_name = original_bom_file.name.rsplit(".", 1)[0]
         st.download_button(
             "Download Final Mapping Result",
             data=mapping_bytes,
-            file_name="original_bom_mapping_result.xlsx",
+            file_name=f"bom_mapping_result_{original_bom_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
